@@ -1,0 +1,502 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create project files
+        run: |
+          cat > settings.gradle <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "PdfReader"
+          include ':app'
+          EOF_FILE
+          cat > build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.jahid.pdfreader'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.jahid.pdfreader"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+              <application
+                  android:label="PDF Reader"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".ReaderActivity" android:exported="false" />
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/jahid/pdfreader
+          cat > app/src/main/java/com/jahid/pdfreader/MainActivity.java <<'EOF_FILE'
+          package com.jahid.pdfreader;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.Settings;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.BaseExpandableListAdapter;
+          import android.widget.Button;
+          import android.widget.ExpandableListView;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          import java.io.File;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.TreeMap;
+
+          public class MainActivity extends Activity {
+              private ExpandableListView list;
+              private TextView status;
+              private Button allow;
+              private SharedPreferences sp;
+              private final List<String> folders = new ArrayList<>();
+              private final Map<String, List<File>> groups = new TreeMap<>();
+              private boolean loaded = false, scanning = false;
+              private FolderAdapter adapter;
+
+              private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density); }
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  sp = getSharedPreferences("reading", MODE_PRIVATE);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(Color.WHITE);
+                  root.setFitsSystemWindows(true);
+
+                  LinearLayout bar = new LinearLayout(this);
+                  bar.setOrientation(LinearLayout.HORIZONTAL);
+                  bar.setGravity(Gravity.CENTER_VERTICAL);
+                  bar.setBackgroundColor(0xFF1E3A8A);
+                  bar.setPadding(dp(16), dp(10), dp(8), dp(10));
+                  TextView title = new TextView(this);
+                  title.setText("My PDFs");
+                  title.setTextColor(Color.WHITE);
+                  title.setTextSize(20);
+                  title.setTypeface(Typeface.DEFAULT_BOLD);
+                  bar.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+                  Button rescan = new Button(this);
+                  rescan.setText("Rescan");
+                  rescan.setOnClickListener(v -> { if (hasAccess()) scan(); });
+                  bar.addView(rescan);
+                  root.addView(bar);
+
+                  status = new TextView(this);
+                  status.setPadding(dp(16), dp(12), dp(16), dp(12));
+                  status.setTextSize(15);
+                  root.addView(status);
+
+                  allow = new Button(this);
+                  allow.setText("Allow file access");
+                  allow.setVisibility(View.GONE);
+                  allow.setOnClickListener(v -> askAccess());
+                  root.addView(allow);
+
+                  list = new ExpandableListView(this);
+                  adapter = new FolderAdapter();
+                  list.setAdapter(adapter);
+                  list.setOnChildClickListener((p, v, g, c, id) -> {
+                      File f = groups.get(folders.get(g)).get(c);
+                      Intent i = new Intent(this, ReaderActivity.class);
+                      i.putExtra("path", f.getAbsolutePath());
+                      startActivity(i);
+                      return true;
+                  });
+                  root.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
+                  setContentView(root);
+
+                  if (!hasAccess() && Build.VERSION.SDK_INT < 30) {
+                      requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, 1);
+                  }
+              }
+
+              private boolean hasAccess() {
+                  if (Build.VERSION.SDK_INT >= 30) return Environment.isExternalStorageManager();
+                  return checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+              }
+
+              private void askAccess() {
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      try {
+                          startActivity(new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                  Uri.parse("package:" + getPackageName())));
+                      } catch (Exception e) {
+                          startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                      }
+                  } else {
+                      requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, 1);
+                  }
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  if (hasAccess()) {
+                      allow.setVisibility(View.GONE);
+                      if (!loaded && !scanning) scan();
+                      else adapter.notifyDataSetChanged();
+                  } else {
+                      allow.setVisibility(View.VISIBLE);
+                      status.setText("Please allow file access so the app can find your PDFs.");
+                  }
+              }
+
+              private void scan() {
+                  scanning = true;
+                  status.setText("Scanning for PDFs...");
+                  new Thread(() -> {
+                      Map<String, List<File>> m = new TreeMap<>();
+                      walk(Environment.getExternalStorageDirectory(), m, 0);
+                      for (List<File> l : m.values()) {
+                          Collections.sort(l, (a, c) -> a.getName().compareToIgnoreCase(c.getName()));
+                      }
+                      List<String> keys = new ArrayList<>(m.keySet());
+                      Collections.sort(keys, (a, c) -> new File(a).getName().compareToIgnoreCase(new File(c).getName()));
+                      runOnUiThread(() -> {
+                          groups.clear();
+                          groups.putAll(m);
+                          folders.clear();
+                          folders.addAll(keys);
+                          int total = 0;
+                          for (List<File> l : m.values()) total += l.size();
+                          status.setText(total + " PDFs in " + keys.size() + " folders");
+                          loaded = true;
+                          scanning = false;
+                          adapter.notifyDataSetChanged();
+                      });
+                  }).start();
+              }
+
+              private void walk(File dir, Map<String, List<File>> m, int depth) {
+                  if (depth > 15) return;
+                  File[] fs = dir.listFiles();
+                  if (fs == null) return;
+                  for (File f : fs) {
+                      String n = f.getName();
+                      if (f.isDirectory()) {
+                          if (n.startsWith(".")) continue;
+                          walk(f, m, depth + 1);
+                      } else if (n.toLowerCase(Locale.ROOT).endsWith(".pdf")) {
+                          List<File> l = m.get(dir.getAbsolutePath());
+                          if (l == null) { l = new ArrayList<>(); m.put(dir.getAbsolutePath(), l); }
+                          l.add(f);
+                      }
+                  }
+              }
+
+              private TextView tv(String t, int size, int color, boolean bold) {
+                  TextView v = new TextView(this);
+                  v.setText(t);
+                  v.setTextSize(size);
+                  v.setTextColor(color);
+                  if (bold) v.setTypeface(Typeface.DEFAULT_BOLD);
+                  return v;
+              }
+
+              private class FolderAdapter extends BaseExpandableListAdapter {
+                  public int getGroupCount() { return folders.size(); }
+                  public int getChildrenCount(int g) { return groups.get(folders.get(g)).size(); }
+                  public Object getGroup(int g) { return folders.get(g); }
+                  public Object getChild(int g, int c) { return groups.get(folders.get(g)).get(c); }
+                  public long getGroupId(int g) { return g; }
+                  public long getChildId(int g, int c) { return c; }
+                  public boolean hasStableIds() { return false; }
+                  public boolean isChildSelectable(int g, int c) { return true; }
+
+                  public View getGroupView(int g, boolean exp, View cv, ViewGroup parent) {
+                      String path = folders.get(g);
+                      LinearLayout l = new LinearLayout(MainActivity.this);
+                      l.setOrientation(LinearLayout.VERTICAL);
+                      l.setBackgroundColor(0xFFF1F5F9);
+                      l.setPadding(dp(44), dp(12), dp(16), dp(12));
+                      l.addView(tv("\uD83D\uDCC1 " + new File(path).getName() + "  (" + getChildrenCount(g) + ")", 17, 0xFF1E3A8A, true));
+                      l.addView(tv(path, 11, 0xFF64748B, false));
+                      return l;
+                  }
+
+                  public View getChildView(int g, int c, boolean last, View cv, ViewGroup parent) {
+                      File f = groups.get(folders.get(g)).get(c);
+                      String name = f.getName();
+                      if (name.length() > 4) name = name.substring(0, name.length() - 4);
+                      LinearLayout l = new LinearLayout(MainActivity.this);
+                      l.setOrientation(LinearLayout.VERTICAL);
+                      l.setPadding(dp(24), dp(10), dp(16), dp(10));
+                      l.addView(tv(name, 16, 0xFF0F172A, false));
+                      String path = f.getAbsolutePath();
+                      int tot = sp.getInt("tot:" + path, 0);
+                      String sub = String.format(Locale.US, "%.1f MB", f.length() / 1048576.0);
+                      if (tot > 0) {
+                          sub += "  \u2022  Page " + (sp.getInt("pos:" + path, 0) + 1) + " / " + tot;
+                      }
+                      l.addView(tv(sub, 12, tot > 0 ? 0xFF1D4ED8 : 0xFF64748B, false));
+                      return l;
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/jahid/pdfreader
+          cat > app/src/main/java/com/jahid/pdfreader/ReaderActivity.java <<'EOF_FILE'
+          package com.jahid.pdfreader;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.SharedPreferences;
+          import android.graphics.Bitmap;
+          import android.graphics.Color;
+          import android.graphics.pdf.PdfRenderer;
+          import android.os.Bundle;
+          import android.os.ParcelFileDescriptor;
+          import android.text.InputType;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.WindowManager;
+          import android.widget.AbsListView;
+          import android.widget.BaseAdapter;
+          import android.widget.EditText;
+          import android.widget.FrameLayout;
+          import android.widget.ImageView;
+          import android.widget.ListView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.io.File;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+
+          public class ReaderActivity extends Activity {
+              private String path;
+              private SharedPreferences sp;
+              private ParcelFileDescriptor pfd;
+              private PdfRenderer renderer;
+              private final Object lock = new Object();
+              private boolean closed = false;
+              private final ExecutorService exec = Executors.newSingleThreadExecutor();
+              private int pageCount, width, itemH;
+              private ListView listView;
+              private TextView indicator;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  path = getIntent().getStringExtra("path");
+                  sp = getSharedPreferences("reading", MODE_PRIVATE);
+                  try {
+                      pfd = ParcelFileDescriptor.open(new File(path), ParcelFileDescriptor.MODE_READ_ONLY);
+                      renderer = new PdfRenderer(pfd);
+                      pageCount = renderer.getPageCount();
+                      PdfRenderer.Page p = renderer.openPage(0);
+                      float pw = p.getWidth(), ph = p.getHeight();
+                      p.close();
+                      width = getResources().getDisplayMetrics().widthPixels;
+                      itemH = (int) (width * ph / pw);
+                  } catch (Exception e) {
+                      Toast.makeText(this, "Cannot open this PDF (protected or damaged)", Toast.LENGTH_LONG).show();
+                      finish();
+                      return;
+                  }
+
+                  FrameLayout root = new FrameLayout(this);
+                  root.setBackgroundColor(0xFF3A3A3A);
+                  listView = new ListView(this);
+                  listView.setDivider(new android.graphics.drawable.ColorDrawable(0xFF3A3A3A));
+                  listView.setDividerHeight(6);
+                  listView.setVerticalScrollBarEnabled(true);
+                  listView.setFastScrollEnabled(true);
+                  listView.setAdapter(new PageAdapter());
+                  root.addView(listView, new FrameLayout.LayoutParams(-1, -1));
+
+                  indicator = new TextView(this);
+                  indicator.setTextColor(Color.WHITE);
+                  indicator.setBackgroundColor(0xAA000000);
+                  indicator.setTextSize(14);
+                  indicator.setPadding(32, 14, 32, 14);
+                  FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+                  lp.bottomMargin = 40;
+                  root.addView(indicator, lp);
+                  indicator.setOnClickListener(v -> askPage());
+                  setContentView(root);
+
+                  int saved = Math.min(sp.getInt("pos:" + path, 0), pageCount - 1);
+                  int off = sp.getInt("off:" + path, 0);
+                  listView.setSelectionFromTop(saved, off);
+                  updateIndicator(saved);
+
+                  listView.setOnScrollListener(new AbsListView.OnScrollListener() {
+                      public void onScrollStateChanged(AbsListView v, int s) { }
+                      public void onScroll(AbsListView v, int first, int vis, int total) { updateIndicator(first); }
+                  });
+              }
+
+              private void updateIndicator(int pos) {
+                  indicator.setText("Page " + (pos + 1) + " / " + pageCount + "  (tap to jump)");
+              }
+
+              private void askPage() {
+                  final EditText et = new EditText(this);
+                  et.setInputType(InputType.TYPE_CLASS_NUMBER);
+                  et.setHint("1 - " + pageCount);
+                  new AlertDialog.Builder(this)
+                          .setTitle("Go to page")
+                          .setView(et)
+                          .setPositiveButton("Go", (d, w) -> {
+                              try {
+                                  int n = Integer.parseInt(et.getText().toString().trim());
+                                  n = Math.max(1, Math.min(pageCount, n));
+                                  listView.setSelection(n - 1);
+                              } catch (Exception ignored) { }
+                          })
+                          .setNegativeButton("Cancel", null)
+                          .show();
+              }
+
+              private void savePosition() {
+                  if (listView == null) return;
+                  int pos = listView.getFirstVisiblePosition();
+                  View c = listView.getChildAt(0);
+                  int off = c == null ? 0 : c.getTop();
+                  sp.edit().putInt("pos:" + path, pos)
+                          .putInt("off:" + path, off)
+                          .putInt("tot:" + path, pageCount)
+                          .apply();
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  savePosition();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  exec.shutdownNow();
+                  synchronized (lock) {
+                      closed = true;
+                      try { if (renderer != null) renderer.close(); } catch (Exception ignored) { }
+                      try { if (pfd != null) pfd.close(); } catch (Exception ignored) { }
+                  }
+              }
+
+              private class PageAdapter extends BaseAdapter {
+                  public int getCount() { return pageCount; }
+                  public Object getItem(int i) { return i; }
+                  public long getItemId(int i) { return i; }
+
+                  public View getView(final int position, View cv, ViewGroup parent) {
+                      final ImageView iv;
+                      if (cv instanceof ImageView) {
+                          iv = (ImageView) cv;
+                      } else {
+                          iv = new ImageView(ReaderActivity.this);
+                          iv.setScaleType(ImageView.ScaleType.FIT_XY);
+                          iv.setLayoutParams(new AbsListView.LayoutParams(width, itemH));
+                      }
+                      iv.setBackgroundColor(Color.WHITE);
+                      iv.setImageBitmap(null);
+                      iv.setTag(position);
+                      try {
+                          exec.submit(() -> {
+                              Object t = iv.getTag();
+                              if (!(t instanceof Integer) || (Integer) t != position) return;
+                              Bitmap bmp = null;
+                              synchronized (lock) {
+                                  if (closed) return;
+                                  PdfRenderer.Page p = null;
+                                  try {
+                                      p = renderer.openPage(position);
+                                      bmp = Bitmap.createBitmap(width, itemH, Bitmap.Config.ARGB_8888);
+                                      bmp.eraseColor(Color.WHITE);
+                                      p.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+                                  } catch (Exception e) {
+                                      bmp = null;
+                                  } finally {
+                                      if (p != null) p.close();
+                                  }
+                              }
+                              final Bitmap out = bmp;
+                              if (out == null) return;
+                              runOnUiThread(() -> {
+                                  Object t2 = iv.getTag();
+                                  if (t2 instanceof Integer && (Integer) t2 == position) iv.setImageBitmap(out);
+                              });
+                          });
+                      } catch (Exception ignored) { }
+                      return iv;
+                  }
+              }
+          }
+          EOF_FILE
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PdfReader-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
